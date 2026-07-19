@@ -19,6 +19,8 @@
 #include "DBCStores.h"
 #include "StringFormat.h"
 #include <cmath>
+#include <ctime>
+#include <unordered_set>
 
 class spp_dynamic_xp_rate : public PlayerScript
 {
@@ -56,6 +58,15 @@ public:
         else                  return sConfigMgr->GetOption<float>(prefix + ".75-79", 1.0f);
     }
 
+    static std::string FormatMoney(uint32 copper)
+    {
+        uint32 gold = copper / 10000;
+        uint32 silver = (copper / 100) % 100;
+        uint32 copperOnly = copper % 100;
+
+        return Acore::StringFormat("{}g {}s {}c", gold, silver, copperOnly);
+    }
+
     static bool IsInInstance(Player* player)
     {
         Map* map = player->GetMap();
@@ -65,6 +76,41 @@ public:
     static bool IsPlayerBot(Player* player)
     {
         return player->GetSession() && player->GetSession()->IsBot();
+    }
+
+    static bool IsWeekendActive()
+    {
+        if (!sConfigMgr->GetOption<bool>("Dynamic.Weekend.Enable", true))
+            return false;
+
+        std::time_t now = std::time(nullptr);
+        std::tm localTime{};
+
+#if defined(_WIN32)
+        localtime_s(&localTime, &now);
+#else
+        localtime_r(&now, &localTime);
+#endif
+
+        // tm_wday: 0 = Sunday, 5 = Friday, 6 = Saturday.
+        return localTime.tm_wday == 5 || localTime.tm_wday == 6 || localTime.tm_wday == 0;
+    }
+
+    static float GetWeekendMultiplier()
+    {
+        if (!IsWeekendActive())
+            return 1.0f;
+
+        float mult = sConfigMgr->GetOption<float>("Dynamic.Weekend.Multiplier", 2.0f);
+        if (mult < 1.0f)
+            mult = 1.0f;
+
+        return mult;
+    }
+
+    static char const* WeekendTag()
+    {
+        return IsWeekendActive() ? " Weekend bonus active." : "";
     }
 
     static bool BotHasRealPlayerInGroup(Player* player)
@@ -115,6 +161,8 @@ public:
 
     // ── Skill XP Roll ─────────────────────────────────────────────────
 
+    std::unordered_set<uint64> _skillXpBypass;
+
     static uint32 GetSkillXPRoll()
     {
         uint32 roll = urand(1, 100);
@@ -125,9 +173,19 @@ public:
         else                 return 5;
     }
 
-    void AwardSkillXP(Player* player, uint32 skillId, bool allowOverflow = false)
+    uint32 AwardSkillXP(Player* player, uint32 skillId, bool allowOverflow = false)
     {
         uint32 xp = GetSkillXPRoll();
+
+        float weekendMult = GetWeekendMultiplier();
+        if (weekendMult > 1.0f)
+            xp = std::max<uint32>(1, static_cast<uint32>(std::round(float(xp) * weekendMult)));
+
+        // Prevent this tiny skill XP reward from being re-scaled by OnPlayerGiveXP.
+        uint64 guid = player->GetGUID().GetCounter();
+        _skillXpBypass.insert(guid);
+        player->GiveXP(xp, nullptr);
+        _skillXpBypass.erase(guid);
 
         if (allowOverflow && xp > 1)
         {
@@ -141,11 +199,10 @@ public:
             }
         }
 
-        player->GiveXP(xp, nullptr);
-
         switch (xp)
         {
-        case 1: break;
+        case 1:
+            break;
         case 2:
             ChatHandler(player->GetSession()).PSendSysMessage(
                 "|cff00ff00Lucky! Bonus skill gain! +2 XP!|r");
@@ -164,15 +221,25 @@ public:
                 "|cffFFD700*** JACKPOT! Bonus skill gain! +5 XP! ***|r");
 
             if (Group* group = player->GetGroup())
+            {
                 for (GroupReference* gref = group->GetFirstMember(); gref; gref = gref->next())
+                {
                     if (Player* member = gref->GetSource(); member && member != player)
+                    {
                         ChatHandler(member->GetSession()).PSendSysMessage(
                             "|cffFFD700*** %s hit a JACKPOT skill roll! ***|r",
                             player->GetName().c_str());
+                    }
+                }
+            }
+
             break;
         }
-        default: break;
+        default:
+            break;
         }
+
+        return xp;
     }
 
     // ── Account Tracking (Faction-Aware) ─────────────────────────────
@@ -326,8 +393,17 @@ public:
     void OnPlayerLogin(Player* player) override
     {
         if (sConfigMgr->GetOption<bool>("Dynamic.XP.Rate.Announce", true))
+        {
             ChatHandler(player->GetSession()).SendSysMessage(
                 "This server is running the |cff4CFF00Dynamic Rate|r module.");
+
+            if (IsWeekendActive())
+            {
+                ChatHandler(player->GetSession()).PSendSysMessage(
+                    "|cffFFD700Weekend rates active: {:.2f}x XP, reputation, gold, and skill XP.|r",
+                    GetWeekendMultiplier());
+            }
+        }
 
         uint32 accountId = player->GetSession()->GetAccountId();
         uint8  faction = GetFactionId(player->GetTeamId());
@@ -374,6 +450,9 @@ public:
         if (!player || !sConfigMgr->GetOption<bool>("Dynamic.XP.Rate", true))
             return;
 
+        if (_skillXpBypass.find(player->GetGUID().GetCounter()) != _skillXpBypass.end())
+            return;
+
         uint32 originalAmount = amount;
 
         uint8 level = player->GetLevel();
@@ -397,17 +476,18 @@ public:
 
         float botRate = 1.0f;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
-            botRate = sConfigMgr->GetOption<float>("Dynamic.XP.BotSoloRate", 0.5f);
+            botRate = sConfigMgr->GetOption<float>("Dynamic.XP.BotSoloRate", 1.5f);
 
-        float totalMult = bracket * source * altBonus * botRate;
+        float weekendMult = GetWeekendMultiplier();
+        float totalMult = bracket * source * altBonus * botRate * weekendMult;
         amount = static_cast<uint32>(std::round(originalAmount * totalMult));
 
         // Show XP breakdown to real players when rate changes the value
         if (!IsPlayerBot(player) && amount != originalAmount)
         {
             std::string msg = Acore::StringFormat(
-                "|cff00CCFFAshbringer XP:|r {} |cff888888→|r |cff00FF00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r",
-                originalAmount, amount, totalMult);
+                "|cff00CCFFAshbringer XP:|r {} |cff888888→|r |cff00FF00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r{}",
+                originalAmount, amount, totalMult, WeekendTag());
             ChatHandler(player->GetSession()).SendSysMessage(msg.c_str());
         }
     }
@@ -426,15 +506,16 @@ public:
         float altBonus = sConfigMgr->GetOption<bool>("Dynamic.Rep.AccountBonus.Enable", false)
             ? GetAltBonus(player) : 1.0f;
 
-        float totalMult = rate * altBonus;
+        float weekendMult = GetWeekendMultiplier();
+        float totalMult = rate * altBonus * weekendMult;
         standing = static_cast<int32>(std::round(standing * totalMult));
 
         // Show rep breakdown to real players when rate changes the value
         if (!IsPlayerBot(player) && standing != originalStanding)
         {
             std::string msg = Acore::StringFormat(
-                "|cffFF8C00Ashbringer REP:|r {} |cff888888→|r |cffFFCC00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r",
-                originalStanding, standing, totalMult);
+                "|cffFF8C00Ashbringer REP:|r {} |cff888888→|r |cffFFCC00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r{}",
+                originalStanding, standing, totalMult, WeekendTag());
             ChatHandler(player->GetSession()).SendSysMessage(msg.c_str());
         }
 
@@ -449,7 +530,7 @@ public:
         if (!sConfigMgr->GetOption<bool>("Dynamic.Gold.Rate", true))
             return;
 
-        float rate = GetBracketRate(killer->GetLevel(), "Dynamic.Gold.Rate");
+        float rate = GetBracketRate(killer->GetLevel(), "Dynamic.Gold.Rate") * GetWeekendMultiplier();
         if (rate == 1.0f)
             return;
 
@@ -460,8 +541,8 @@ public:
         if (!IsPlayerBot(killer) && killed->loot.gold != originalGold)
         {
             std::string msg = Acore::StringFormat(
-                "|cffFFD700Ashbringer GOLD:|r {}c |cff888888→|r |cffFFFF00{}c|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r",
-                originalGold, killed->loot.gold, rate);
+                "|cffFFD700Ashbringer GOLD:|r {} |cff888888→|r |cffFFFF00{}|r |cff888888(|r|cffFFD700{:.2f}x|r|cff888888)|r{}",
+                FormatMoney(originalGold), FormatMoney(killed->loot.gold), rate, WeekendTag());
             ChatHandler(killer->GetSession()).SendSysMessage(msg.c_str());
         }
     }
@@ -476,25 +557,35 @@ public:
             return;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             return;
-        AwardSkillXP(player, skillId, true);
+
+        uint32 roll = AwardSkillXP(player, skillId, true);
+
+        // Make jackpot affect the actual profession skill gain.
+        if (roll > gain)
+            gain = roll;
     }
 
     // Crafting — alchemy, blacksmithing, cooking, etc.
     void OnPlayerUpdateCraftingSkill(Player* player, SkillLineAbilityEntry const* skill,
         uint32 /*currentLevel*/, uint32& gain) override
     {
-        if (!player || gain == 0)
+        if (!player || !skill || gain == 0)
             return;
         if (!sConfigMgr->GetOption<bool>("Dynamic.Skill.XP.Enable", true))
             return;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             return;
-        AwardSkillXP(player, skill->SkillLine, true);
+
+        uint32 roll = AwardSkillXP(player, skill->SkillLine, true);
+
+        // Make jackpot affect the actual profession skill gain.
+        if (roll > gain)
+            gain = roll;
     }
 
     // Weapons, defense, fishing, etc.
     void OnPlayerUpdateSkill(Player* player, uint32 skillId, uint32 value,
-        uint32 /*max*/, uint32 /*step*/, uint32 newValue) override
+        uint32 max, uint32 step, uint32 newValue) override
     {
         if (!player || newValue <= value)
             return;
@@ -502,7 +593,18 @@ public:
             return;
         if (IsPlayerBot(player) && !BotHasRealPlayerInGroup(player))
             return;
-        AwardSkillXP(player, skillId, false);
+
+        uint32 roll = AwardSkillXP(player, skillId, false);
+
+        // This hook has no gain reference, so manually add the extra points after the normal +1.
+        if (roll > 1)
+        {
+            uint32 current = player->GetSkillValue(skillId);
+            uint32 target = std::min(current + (roll - 1), max);
+
+            if (target > current)
+                player->SetSkill(skillId, step, target, max);
+        }
     }
 };
 

@@ -90,6 +90,15 @@ Dynamic.XP.AccountBonus.PerMaxedChar = 0.25
 Dynamic.XP.AccountBonus.MaxMultiplier = 5.0   
    
 Dynamic.Skill.XP.Enable = true
+#
+# Dynamic XP Weekend Bonus
+#
+# Saturday/Sunday server-local time.
+# Multiplies the final XP/rep/gold/skill result after your normal brackets,
+# quest/kill/dungeon multipliers, account bonus, and bot solo rate.
+Dynamic.Weekend.Enable = 1
+Dynamic.Weekend.Multiplier = 2.0
+
 
 
 ##################################################################################################################

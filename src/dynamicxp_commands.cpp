@@ -120,36 +120,54 @@ public:
     {
         if (args.empty())
         {
-            handler->SendSysMessage("Usage: dynxp account_info <account_id>");
+            handler->SendSysMessage("Usage: dynxp account_info <account_name>");
             return false;
         }
 
-        uint32 accountId = static_cast<uint32>(std::stoul(args));
+        // Look up account ID from name
+        QueryResult accountResult = LoginDatabase.Query(
+            "SELECT id FROM account WHERE username = '{}'",
+            args);
 
+        if (!accountResult)
+        {
+            handler->PSendSysMessage("Account '{}' not found.", args);
+            return false;
+        }
+
+        uint32 accountId = accountResult->Fetch()[0].Get<uint32>();
+        handler->PSendSysMessage("Account: '{}' | ID: {}", args, accountId);
+
+        // Group info
         QueryResult groupResult = CharacterDatabase.Query(
             "SELECT group_id FROM account_link_groups WHERE account_id = {}", accountId);
 
         if (groupResult)
         {
             uint32 groupId = groupResult->Fetch()[0].Get<uint32>();
-            handler->PSendSysMessage("Account {} is in link group {}.", accountId, groupId);
+            handler->PSendSysMessage("Link Group: {}", groupId);
 
             QueryResult members = CharacterDatabase.Query(
-                "SELECT account_id FROM account_link_groups WHERE group_id = {}", groupId);
+                "SELECT alg.account_id, a.username FROM account_link_groups alg "
+                "JOIN acore_auth.account a ON a.id = alg.account_id "
+                "WHERE alg.group_id = {}", groupId);
             if (members)
             {
-                handler->SendSysMessage("Group members:");
-                do {
-                    handler->PSendSysMessage("  -> Account {}",
-                        members->Fetch()[0].Get<uint32>());
+                handler->SendSysMessage("Linked accounts:");
+                do
+                {
+                    Field* fields = members->Fetch();
+                    handler->PSendSysMessage("  -> {} (ID: {})",
+                        fields[1].Get<std::string>(), fields[0].Get<uint32>());
                 } while (members->NextRow());
             }
         }
         else
         {
-            handler->PSendSysMessage("Account {} has no link group.", accountId);
+            handler->SendSysMessage("Not linked to any group.");
         }
 
+        // Bonus info per faction
         for (uint8 faction = 0; faction <= 1; ++faction)
         {
             const char* factionName = (faction == 0) ? "Alliance" : "Horde";
