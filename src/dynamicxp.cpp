@@ -21,6 +21,7 @@
 #include <cmath>
 #include <ctime>
 #include <unordered_set>
+#include "Playerbots.h"
 
 class spp_dynamic_xp_rate : public PlayerScript
 {
@@ -75,7 +76,14 @@ public:
 
     static bool IsPlayerBot(Player* player)
     {
-        return player->GetSession() && player->GetSession()->IsBot();
+        if (!player || !player->GetSession())
+            return false;
+
+#ifdef PLAYERBOT
+        return player && sPlayerbotsMgr.GetPlayerbotAI(player) != nullptr;
+#else
+        return false;
+#endif        
     }
 
     static bool IsWeekendActive()
